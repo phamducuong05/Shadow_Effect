@@ -1,73 +1,151 @@
-# GPSDiffusion-Object-Shadow-Generation-SDXL
+# Shadow Effect — GPSDiffusion SDXL FastAPI Demo
 
-Welcome to scan the WeChat QR code to join the discussion group on image composition/compositing, object insertion/addition.
-<p align="center">
-<img width="150" height="150" alt="Image" src="https://github.com/user-attachments/assets/8572a7c4-0f62-4a5f-bc06-9a1d9fcb14e3" />
-</p>
+Demo tạo bóng cho vật thể bằng GPSDiffusion SDXL. Đầu vào gồm ảnh composite
+và mask của vật thể; đầu ra gồm ảnh sinh thô, ảnh hậu xử lý và mask bóng.
+Giao diện thử model được cung cấp qua FastAPI Swagger.
 
-This repository presents GPSDiffusion-SDXL, an upgraded version of our [GPSDiffusion](https://github.com/bcmi/GPSDiffusion-Object-Shadow-Generation):
+Repo này dành cho chạy inference demo trên GPU server. Không cần tải dataset,
+không cần train model và không cần chạy `accelerate config`.
 
-> **Shadow Generation Using Diffusion Model with Geometry Prior** [[pdf]](https://openaccess.thecvf.com/content/CVPR2025/papers/Zhao_Shadow_Generation_Using_Diffusion_Model_with_Geometry_Prior_CVPR_2025_paper.pdf) [[supp]](https://openaccess.thecvf.com/content/CVPR2025/supplemental/Zhao_Shadow_Generation_Using_CVPR_2025_supplemental.pdf) <br>  
->
-> Haonan Zhao, Qingyang Liu, Xinhao Tao, Li Niu, Guangtao Zhai<br>
-> Accepted by **CVPR 2025**.
+## Luồng xử lý
 
-We replace the original Stable Diffusion 1.5 (SD 1.5) with the more advanced Stable Diffusion XL (SDXL) for enhanced generation performance. The following visual comparison demonstrates the quality improvements of SDXL over its predecessor SD 1.5. From left to right, we show the composite image, foreground mask, the result based on SD 1.5, the result based on SD XL, and ground-truth.
+```text
+Ảnh composite + object mask
+        ↓
+Geometry predictor + mask embeddings
+        ↓
+GPSDiffusion SDXL (ControlNet + IP-Adapter)
+        ↓
+Ảnh sinh 512×512
+        ↓
+Post-processing tùy chọn
+        ↓
+Ảnh hoàn thiện + shadow mask 256×256
+```
 
-<p align='center'>  
-  <img src='cmp_with_sd1_5.png'  width=80% />
-</p>
+## Yêu cầu khuyến nghị
 
-We also present a visual comparison between SDXL and SD 1.5 using different random seeds. From left to right, we show the composite image, foreground mask, four SD1.5 outputs with varying seeds, four SDXL outputs with varying seeds, and the ground-truth. Notably, the SDXL version demonstrates significantly improved output stability.
+- Linux GPU server với NVIDIA GPU 16 GB VRAM; nên còn khoảng 15 GB trống.
+- Khoảng 32 GB RAM hệ thống cho CPU offload.
+- Khoảng 40 GB ổ đĩa trống cho checkpoint và cache SDXL.
+- Conda và NVIDIA driver tương thích CUDA.
 
-<p align='center'>  
-  <img src='cmp_with_sd1_5_ranseed.png'  width=90% />
-</p>
+## Clone repository
 
+```bash
+git clone https://github.com/phamducuong05/Shadow_Effect.git
+cd Shadow_Effect
+```
 
-### Online Demo
+## Đặt model weights
 
-Our GPSDiffusion has been integrated into [libcom](https://github.com/bcmi/libcom) toolbox. Try this [online demo](http://libcom.ustcnewly.com/) for image composition (object insertion) built upon [libcom](https://github.com/bcmi/libcom) toolbox and have fun!
+```text
+Shadow_Effect/
+├── pretrained_models/
+│   ├── controlnet/
+│   │   ├── config.json
+│   │   └── diffusion_pytorch_model.safetensors
+│   ├── ip_adapter.ckpt
+│   ├── Shadow_cls.pth
+│   ├── Shadow_reg.pth
+│   └── Shadow_cls_label.pkl
+└── models/
+    └── pretrained_models/
+        └── Shadow_ppp.ckpt
+```
 
-[![]](https://github.com/user-attachments/assets/87416ec5-2461-42cb-9f2d-5030b1e1b5ec)
+Thư mục `controlnet/` có thể chứa file `.bin`, file index và nhiều shard.
+Hãy giữ nguyên toàn bộ cấu trúc từ archive checkpoint SDXL. Weight không được
+đưa lên Git vì đã có trong `.gitignore`.
 
-### Installation
-- Clone this repo:
-    git clone https://github.com/bcmi/GPSDiffusion-Object-Shadow-Generation-SDXL.git
-- Download the DESOBAv2 dataset from [[Baidu Cloud]](https://pan.baidu.com/s/1_nXb3ElxImmsq2BPcBGdPQ?pwd=bcmi) (access code: bcmi) or [[Dropbox]](https://www.dropbox.com/scl/fo/f71dg98aszqxtn2qs3l1c/ALS7dpAe3dBPbYbRaq10mnY?rlkey=6cm1vcma91yn06ziy3v4cxzxg&st=69kd9ihx&dl=0). Unzip `desobav2-256x256.rar` to `./data/`, and rename it to `desobav2`.
-- Download the checkpoints from [[Baidu Cloud]](https://pan.baidu.com/s/13NYGw3SS4B4n6mPtU1Me1Q?pwd=bcmi) (access code: bcmi). Unzip `pretrained_models.zip`.
+Checkpoint SDXL gốc: [Baidu Cloud](https://pan.baidu.com/s/13NYGw3SS4B4n6mPtU1Me1Q?pwd=bcmi),
+mã truy cập `bcmi`.
 
-### Environment
-    conda create -n GPSDiffusion python=3.8
-    conda activate GPSDiffusion
-    pip install -r requirements.txt
+Model nền `stabilityai/stable-diffusion-xl-base-1.0` được tải từ Hugging Face
+ở lần chạy đầu và được lưu trong cache.
 
-    git clone https://github.com/huggingface/diffusers
-    cd diffusers
-    pip install -e .
+## Tạo môi trường Conda
 
-And initialize an [🤗Accelerate](https://github.com/huggingface/accelerate/) environment with:
+```bash
+conda create -n gpsdiffusion-sdxl-demo python=3.10 -y
+conda activate gpsdiffusion-sdxl-demo
+python -m pip install --upgrade pip
 
-    accelerate config
+python -m pip install torch==2.4.0 torchvision==0.19.0 \
+  --index-url https://download.pytorch.org/whl/cu121
 
-Or for a default accelerate configuration without answering questions about your environment:
+python -m pip install -r requirements-demo.txt
+python -m pip check
+python check_demo.py
+```
 
-    accelerate config default
+`check_demo.py` kiểm tra dependency, CUDA, VRAM và danh sách weight còn thiếu
+mà không nạp toàn bộ model.
 
-### Training
-    accelerate launch train_GPSDiffusion_sdxl.py
+## Chạy FastAPI
 
-### Inference
-    accelerate launch test_GPSDiffusion_sdxl.py
+```bash
+export CUDA_VISIBLE_DEVICES=0
+python -m uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
+```
 
-### Post-processing
-    python post_processing.py
-    
-## Other Resources
+Chỉ chạy một Uvicorn worker vì mỗi worker sẽ tạo một bản model riêng trên GPU.
 
-+ [Awesome-Object-Shadow-Generation](https://github.com/bcmi/Awesome-Object-Shadow-Generation)
-+ [Awesome-Image-Composition](https://github.com/bcmi/Awesome-Object-Insertion)
+Nếu server ở xa, tạo SSH tunnel từ máy cá nhân:
 
-## Acknowledgments
-Parts of this code were derived from:<br>
-https://github.com/huggingface/diffusers
+```bash
+ssh -N -L 8000:127.0.0.1:8000 USER@SERVER_IP
+```
+
+Mở:
+
+- Swagger UI: <http://127.0.0.1:8000/docs>
+- Health check: <http://127.0.0.1:8000/health>
+
+Trong `POST /predict`, upload:
+
+- `image`: ảnh composite đã có vật thể.
+- `mask`: cùng kích thước với ảnh; vật thể trắng, nền đen.
+- `num_samples`: bắt đầu với `1`.
+- `num_steps`: mặc định `50`.
+- `seed`: mặc định `42`.
+- `apply_postprocess`: `true` để sinh thêm ảnh hậu xử lý và mask bóng.
+
+Kết quả được lưu tại `outputs/<request_id>/`. API trả URL cho từng ảnh và
+`peak_vram_gb` để theo dõi mức VRAM đỉnh trong inference.
+
+## Chế độ VRAM thấp
+
+Nếu gặp CUDA out-of-memory, dừng server và chạy lại:
+
+```bash
+export GPSXL_LOW_VRAM=true
+python -m uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Chế độ này chuyển ControlNet và UNet lên GPU luân phiên nên chậm hơn, nhưng
+giảm lượng model cùng nằm trên VRAM. Vẫn nên để `num_samples=1` khi thử đầu tiên.
+
+## Kiểm thử
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Các test CPU kiểm tra tiền xử lý ảnh/mask, geometry, attention, seed, offload,
+API upload/download, xử lý lỗi và model hậu xử lý. Chất lượng ảnh và mức VRAM
+thực tế cần được xác nhận bằng checkpoint thật trên GPU server.
+
+Xem [DEMO.md](DEMO.md) để có hướng dẫn đầy đủ, xử lý lỗi thường gặp và toàn bộ
+biến môi trường cấu hình.
+
+## Nguồn và giấy phép
+
+Dự án phát triển từ
+[bcmi/GPSDiffusion-Object-Shadow-Generation-SDXL](https://github.com/bcmi/GPSDiffusion-Object-Shadow-Generation-SDXL)
+và công trình:
+
+> Haonan Zhao, Qingyang Liu, Xinhao Tao, Li Niu, Guangtao Zhai,
+> “Shadow Generation Using Diffusion Model with Geometry Prior,” CVPR 2025.
+
+Mã nguồn tuân theo giấy phép trong [LICENSE](LICENSE).

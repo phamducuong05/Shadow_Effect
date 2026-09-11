@@ -152,10 +152,10 @@ class RegNetwork(BaseNetwork):
 
 class MaskCls(BaseNetwork):
 
-    def __init__(self, num_classes=256):
+    def __init__(self, num_classes=256, pretrained=True):
         super(MaskCls, self).__init__()
         # 加载预训练的ResNet模型，这里选择ResNet50作为基础模型
-        self.resnet = models.resnet50(pretrained=True)
+        self.resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
         self.resnet.conv1 = nn.Conv2d(4, 64, kernel_size=7, stride=2, padding=3, bias=False)
         # 替换最后一层全连接层
         num_features = self.resnet.fc.in_features

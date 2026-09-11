@@ -3,11 +3,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import xformers
+try:
+    import xformers
+    import xformers.ops
+except ImportError:
+    xformers = None
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import inspect
 import warnings
 from packaging import version
+from contextlib import nullcontext
+
+def _sdpa_backend(device):
+    """Use the stable math backend for CPU tests; keep CUDA selection intact."""
+    if device.type != "cpu":
+        return nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(SDPBackend.MATH)
+    except ImportError:
+        return nullcontext()
+
 
 class AttnProcessor(nn.Module):
     r"""
@@ -398,9 +414,10 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        with _sdpa_backend(query.device):
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -414,9 +431,10 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        ip_hidden_states = F.scaled_dot_product_attention(
-            query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
-        )
+        with _sdpa_backend(query.device):
+            ip_hidden_states = F.scaled_dot_product_attention(
+                query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
+            )
         with torch.no_grad():
             self.attn_map = query @ ip_key.transpose(-2, -1).softmax(dim=-1)
             #print(self.attn_map.shape)
@@ -509,9 +527,10 @@ class AttnProcessor2_0(torch.nn.Module):
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        with _sdpa_backend(query.device):
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
