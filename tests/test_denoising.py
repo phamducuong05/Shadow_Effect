@@ -72,7 +72,12 @@ class DenoisingTests(unittest.TestCase):
         torch.manual_seed(123)
         runner = CpuHarness()
         prepared = prepare_inputs(Image.new("RGB", (32, 32), "white"), Image.new("L", (32, 32), 255))
-        first = runner.generate(prepared, num_samples=2, num_steps=2, seed=42, apply_postprocess=False)
+        with self.assertLogs("uvicorn.error", level="INFO") as captured:
+            first = runner.generate(prepared, num_samples=2, num_steps=2, seed=42, apply_postprocess=False)
+        messages = "\n".join(captured.output)
+        self.assertIn("Denoising 2/2 (100%)", messages)
+        self.assertIn("[sample 2/2] Complete", messages)
+        self.assertIn("[inference] Complete", messages)
         runner.settings.low_vram = True
         repeat = runner.generate(prepared, num_steps=2, seed=42, apply_postprocess=False)
         self.assertEqual(first.seeds, [42, 43])

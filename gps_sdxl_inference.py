@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 import codecs
 import gc
 import io
+import logging
 import os
 from pathlib import Path
 import pickle
+import time
 
 import cv2
 import numpy as np
@@ -19,6 +21,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent
 RESOLUTION = 512
 PROMPT = "foreground object with shadow"
+logger = logging.getLogger("uvicorn.error")
 
 
 def _env_path(name, default):
@@ -213,8 +216,11 @@ class GPSDiffusionXLRunner:
         torch.cuda.set_device(self.device)
         self.dtype = torch.float16
         self.models = []
+        load_started = time.perf_counter()
+        logger.info("[load] Starting GPSDiffusion model load on %s (low_vram=%s)", self.device, settings.low_vram)
         try:
             self._load()
+            logger.info("[load] Models ready in %.1f seconds", time.perf_counter() - load_started)
         except Exception:
             self._offload_all()
             raise
@@ -232,9 +238,11 @@ class GPSDiffusionXLRunner:
 
         # Encode the fixed prompt with one text encoder at a time, then release
         # both encoders permanently. No dataset or on-disk embedding cache.
+        logger.info("[load 1/7] Encoding the fixed prompt with SDXL text encoders")
         prompt_parts = []
         for index, cls in enumerate((CLIPTextModel, CLIPTextModelWithProjection)):
             suffix = "" if index == 0 else "_2"
+            logger.info("[load 1/7] Text encoder %d/2", index + 1)
             tokenizer = AutoTokenizer.from_pretrained(self.settings.base_model, subfolder="tokenizer" + suffix, use_fast=False)
             encoder = cls.from_pretrained(self.settings.base_model, subfolder="text_encoder" + suffix, torch_dtype=self.dtype)
             try:
@@ -251,25 +259,31 @@ class GPSDiffusionXLRunner:
                 del encoder
                 self._empty_cache()
         self.prompt_embeds = torch.cat(prompt_parts, dim=-1)
+        logger.info("[load 2/7] Loading scheduler and VAE")
         self.scheduler = DDPMScheduler.from_pretrained(self.settings.base_model, subfolder="scheduler")
         self.vae = self._keep(AutoencoderKL.from_pretrained(self.settings.base_model, subfolder="vae", torch_dtype=torch.float32))
         self.vae.enable_slicing()
         self.vae.enable_tiling()
+        logger.info("[load 3/7] Loading UNet")
         self.unet = self._keep(UNet2DConditionModel.from_pretrained(self.settings.base_model, subfolder="unet", torch_dtype=self.dtype))
+        logger.info("[load 4/7] Loading IP-Adapter checkpoint")
         checkpoint = load_tensor_checkpoint(self.settings.weights_dir / "ip_adapter.ckpt")
         self.projection = self._keep(install_ip_adapter(self.unet, checkpoint).to(dtype=self.dtype))
         # New attention modules are initially FP32; cast them along with UNet.
         self.unet.to(dtype=self.dtype)
         del checkpoint
+        logger.info("[load 5/7] Loading ControlNet")
         self.controlnet = self._keep(ControlNetModel.from_pretrained(self.settings.weights_dir / "controlnet", torch_dtype=self.dtype))
         if self.controlnet.config.conditioning_channels != 5:
             raise ValueError("Expected GPSDiffusion SDXL ControlNet with 5 conditioning channels (RGB + object mask + geometry).")
+        logger.info("[load 6/7] Loading geometry classifier and regressor")
         self.classifier = self._keep(MaskCls(num_classes=256, pretrained=False))
         self.regressor = self._keep(RegNetwork())
         for model, filename in ((self.classifier, "Shadow_cls.pth"), (self.regressor, "Shadow_reg.pth")):
             state = load_tensor_checkpoint(self.settings.weights_dir / filename)
             model.load_state_dict(state["net"], strict=True)
             model.to(dtype=self.dtype)
+        logger.info("[load 7/7] Loading centroid labels")
         with (self.settings.weights_dir / "Shadow_cls_label.pkl").open("rb") as handle:
             # Only load the checkpoint/centroid files obtained from the author.
             self.centroids = pickle.load(handle)
@@ -298,6 +312,7 @@ class GPSDiffusionXLRunner:
 
     @torch.inference_mode()
     def _generate_one(self, prepared, num_steps, seed, apply_postprocess):
+        logger.info("[seed %d] Preparing geometry and latent", seed)
         generator = torch.Generator(device=self.device).manual_seed(seed)
         rng = np.random.default_rng(seed)
         geometry = torch.from_numpy(prepared.control).to(self.device, dtype=self.dtype)
@@ -332,7 +347,9 @@ class GPSDiffusionXLRunner:
         if not self.settings.low_vram:
             self.controlnet.to(self.device)
             self.unet.to(self.device)
-        for timestep in self.scheduler.timesteps:
+        progress_interval = max(1, num_steps // 10)
+        logger.info("[seed %d] Denoising started: %d steps", seed, num_steps)
+        for step_index, timestep in enumerate(self.scheduler.timesteps, start=1):
             if self.settings.low_vram:
                 self.controlnet.to(self.device)
             down, mid = self.controlnet(latents, timestep, encoder_hidden_states=prompt,
@@ -349,11 +366,15 @@ class GPSDiffusionXLRunner:
                 self._empty_cache()
             latents = self.scheduler.step(prediction, timestep, latents, generator=generator).prev_sample
             del down, mid, prediction
+            if step_index == 1 or step_index % progress_interval == 0 or step_index == num_steps:
+                logger.info("[seed %d] Denoising %d/%d (%d%%)",
+                            seed, step_index, num_steps, round(step_index * 100 / num_steps))
         self.unet.cpu()
         self.controlnet.cpu()
         del control, geometry, embeddings, ip_prompt
         self._empty_cache()
 
+        logger.info("[seed %d] Decoding generated image", seed)
         self.vae.to(self.device)
         decoded = self.vae.decode(latents.float() / self.vae.config.scaling_factor).sample
         if not torch.isfinite(decoded).all():
@@ -366,6 +387,7 @@ class GPSDiffusionXLRunner:
         if not apply_postprocess:
             return generated, None, None
 
+        logger.info("[seed %d] Running postprocess", seed)
         self._load_postprocess()
         self.postprocess.to(self.device)
         original = np.asarray(Image.fromarray(prepared.image).resize((256, 256), Image.Resampling.BILINEAR))
@@ -390,8 +412,13 @@ class GPSDiffusionXLRunner:
         if track_vram:
             torch.cuda.reset_peak_memory_stats(self.device)
         result = InferenceResult([], [], [], [], 0)
+        inference_started = time.perf_counter()
+        logger.info("[inference] Starting %d sample(s), %d step(s), seed=%d, postprocess=%s",
+                    num_samples, num_steps, seed, apply_postprocess)
         try:
             for index in range(num_samples):
+                sample_started = time.perf_counter()
+                logger.info("[sample %d/%d] Starting with seed %d", index + 1, num_samples, seed + index)
                 try:
                     generated, refined, mask = self._generate_one(prepared, num_steps, seed + index, apply_postprocess)
                     result.generated.append(generated)
@@ -399,10 +426,14 @@ class GPSDiffusionXLRunner:
                     if refined is not None:
                         result.postprocessed.append(refined)
                         result.shadow_masks.append(mask)
+                    logger.info("[sample %d/%d] Complete in %.1f seconds",
+                                index + 1, num_samples, time.perf_counter() - sample_started)
                 finally:
                     self._offload_all()
             if track_vram:
                 result.peak_vram_gb = round(torch.cuda.max_memory_reserved(self.device) / 1024**3, 3)
+            logger.info("[inference] Complete in %.1f seconds; peak VRAM %.3f GiB",
+                        time.perf_counter() - inference_started, result.peak_vram_gb)
             return result
         finally:
             self._offload_all()

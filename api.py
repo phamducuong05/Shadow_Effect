@@ -2,6 +2,7 @@
 import gc
 import logging
 import threading
+import time
 from typing import Annotated
 from uuid import uuid4
 
@@ -12,7 +13,7 @@ import torch
 
 from gps_sdxl_inference import DemoSettings, GPSDiffusionXLRunner, InputValidationError, prepare_inputs
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
@@ -47,6 +48,10 @@ def create_app(settings=None, runner_factory=GPSDiffusionXLRunner):
         nonlocal runner, last_error
         if not lock.acquire(blocking=False):
             raise HTTPException(409, "GPU is busy. Wait for the current request to finish, then retry.")
+        request_id = uuid4().hex
+        request_started = time.perf_counter()
+        logger.info("[request %s] Accepted: samples=%d, steps=%d, seed=%d, postprocess=%s",
+                    request_id, num_samples, num_steps, seed, apply_postprocess)
         try:
             prepared = prepare_inputs(image, mask)
             if apply_postprocess and not settings.load_postprocess:
@@ -55,7 +60,6 @@ def create_app(settings=None, runner_factory=GPSDiffusionXLRunner):
                 runner = runner_factory(settings)
             result = runner.generate(prepared, num_samples=num_samples, num_steps=num_steps,
                                      seed=seed, apply_postprocess=apply_postprocess)
-            request_id = uuid4().hex
             request_dir = settings.output_dir / request_id
             request_dir.mkdir()
             response = {"request_id": request_id, "seeds": result.seeds,
@@ -68,6 +72,8 @@ def create_app(settings=None, runner_factory=GPSDiffusionXLRunner):
                     output.save(request_dir / filename, format="PNG")
                     response[group].append({"filename": filename,
                                             "url": f"{base_url}outputs/{request_id}/{filename}"})
+            logger.info("[request %s] Response ready in %.1f seconds; outputs saved to %s",
+                        request_id, time.perf_counter() - request_started, request_dir)
             last_error = None
             return response
         except InputValidationError as exc:
