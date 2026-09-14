@@ -4,6 +4,7 @@ The denoiser follows test_GPSDiffusion_sdxl.py, including its four IP attention
 tokens and fixed prompt. Models are loaded once, on CPU, then staged on CUDA.
 """
 from dataclasses import dataclass, field
+import codecs
 import gc
 import io
 import os
@@ -24,6 +25,26 @@ def _env_path(name, default):
     path = Path(os.environ.get(name, str(default))).expanduser()
     return path if path.is_absolute() else PROJECT_ROOT / path
 
+
+def load_tensor_checkpoint(path):
+    """Load tensor checkpoints while allowing NumPy scalar metadata.
+
+    PyTorch's weights-only loader remains enabled, so arbitrary checkpoint
+    globals are still rejected. The author checkpoints include NumPy scalars
+    and dtype descriptors produced by older NumPy/PyTorch versions.
+    """
+    from numpy.core.multiarray import scalar as numpy_scalar
+
+    dtype_types = {
+        type(np.dtype(dtype))
+        for dtype in (
+            np.bool_, np.int8, np.int16, np.int32, np.int64,
+            np.uint8, np.uint16, np.uint32, np.uint64,
+            np.float16, np.float32, np.float64,
+        )
+    }
+    torch.serialization.add_safe_globals([numpy_scalar, np.dtype, codecs.encode, *dtype_types])
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 @dataclass
 class DemoSettings:
@@ -235,7 +256,7 @@ class GPSDiffusionXLRunner:
         self.vae.enable_slicing()
         self.vae.enable_tiling()
         self.unet = self._keep(UNet2DConditionModel.from_pretrained(self.settings.base_model, subfolder="unet", torch_dtype=self.dtype))
-        checkpoint = torch.load(self.settings.weights_dir / "ip_adapter.ckpt", map_location="cpu", weights_only=True)
+        checkpoint = load_tensor_checkpoint(self.settings.weights_dir / "ip_adapter.ckpt")
         self.projection = self._keep(install_ip_adapter(self.unet, checkpoint).to(dtype=self.dtype))
         # New attention modules are initially FP32; cast them along with UNet.
         self.unet.to(dtype=self.dtype)
@@ -246,7 +267,7 @@ class GPSDiffusionXLRunner:
         self.classifier = self._keep(MaskCls(num_classes=256, pretrained=False))
         self.regressor = self._keep(RegNetwork())
         for model, filename in ((self.classifier, "Shadow_cls.pth"), (self.regressor, "Shadow_reg.pth")):
-            state = torch.load(self.settings.weights_dir / filename, map_location="cpu", weights_only=True)
+            state = load_tensor_checkpoint(self.settings.weights_dir / filename)
             model.load_state_dict(state["net"], strict=True)
             model.to(dtype=self.dtype)
         with (self.settings.weights_dir / "Shadow_cls_label.pkl").open("rb") as handle:
